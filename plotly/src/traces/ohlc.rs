@@ -98,8 +98,13 @@ where
     X: Serialize + Clone,
     O: Serialize + Clone,
 {
+    #[inline]
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+    #[inline]
+    fn name(&self) -> &Option<String> {
+        &self.name
     }
 }
 

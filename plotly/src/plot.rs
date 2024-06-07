@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write, path::Path};
+use std::{ collections::HashMap, fs::File, io::Write, path::Path};
 
 use askama::Template;
 use dyn_clone::DynClone;
@@ -97,6 +97,7 @@ impl std::fmt::Display for ImageFormat {
 /// understood by Plotly.js.
 pub trait Trace: DynClone + ErasedSerialize {
     fn to_json(&self) -> String;
+    fn name(&self) -> &Option<String>;
 }
 
 dyn_clone::clone_trait_object!(Trace);
@@ -108,6 +109,74 @@ pub struct Traces {
     traces: Vec<Box<dyn Trace>>,
 }
 
+#[derive(Default, Clone)]
+pub struct TraceMap {
+    trace_map: HashMap<Box<Option<String>>,Box<dyn Trace>>,
+    order: Vec<Box<Option<String>>>,
+}
+
+impl Serialize for TraceMap{
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+            Traces{
+                traces:
+                self.order.iter().map(|id|self.trace_map[id].clone()).collect()
+            }.serialize(serializer)
+    }
+}
+
+
+impl TraceMap {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            trace_map: HashMap::with_capacity(1),
+            order: Vec::with_capacity(1),
+        }
+    }
+    #[inline]
+    pub fn push(&mut self, trace: Box<dyn Trace>) {
+        let id = Box::new(trace.name().clone());
+        match self.trace_map.insert(id.clone(), trace){
+            Some(_) => (),
+            None => self.order.push(id),
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, id: &Box<Option<String>>) -> Option<Box<dyn Trace>> {
+        let mut iter = self.order.iter().enumerate();
+        while let Some((idx,order_id)) = iter.next() {
+            if order_id.eq(id){
+                self.order.remove(idx);
+                break;
+            }
+        }
+        self.trace_map.remove(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.trace_map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.trace_map.is_empty()
+    }
+
+    // pub fn iter(&self) -> std::slice::IntoIter<Box<dyn Trace>> {
+    //     let v = self.trace_map.iter().map(|(_,trace)|{
+    //         let trace:Box<dyn Trace>=trace.clone();trace}).collect::<Vec<_>>();
+    //     v.into_iter()
+    // }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+}
+
+
 impl Traces {
     pub fn new() -> Self {
         Self {
@@ -117,6 +186,14 @@ impl Traces {
 
     pub fn push(&mut self, trace: Box<dyn Trace>) {
         self.traces.push(trace)
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<Box<dyn Trace>> {
+        if index <= self.len() - 1 {
+            Some(self.traces.remove(index))
+        } else {
+            None
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -210,6 +287,19 @@ impl Plot {
     /// Add a `Trace` to the `Plot`.
     pub fn add_trace(&mut self, trace: Box<dyn Trace>) {
         self.traces.push(trace);
+    }
+
+    pub fn remove_trace(&mut self, trace_idx: usize) -> Option<Box<dyn Trace>> {
+        self.traces.remove(trace_idx)
+    }
+
+    pub fn remove_traces(&mut self, mut trace_idxs: Vec<usize>) -> Vec<Option<Box<dyn Trace>>> {
+        trace_idxs.sort();
+        trace_idxs
+            .into_iter()
+            .rev()
+            .map(|idx| self.traces.remove(idx))
+            .collect()
     }
 
     /// Add multiple `Trace`s to the `Plot`.

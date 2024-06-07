@@ -362,8 +362,13 @@ impl Image {
 }
 
 impl Trace for Image {
+    #[inline]
     fn to_json(&self) -> String {
-        serde_json::to_string(&self).unwrap()
+        serde_json::to_string(self).unwrap()
+    }
+    #[inline]
+    fn name(&self) -> &Option<String> {
+        &self.name
     }
 }
 

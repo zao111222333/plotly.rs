@@ -330,8 +330,13 @@ where
     Theta: Serialize + Clone + 'static,
     R: Serialize + Clone + 'static,
 {
+    #[inline]
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+    #[inline]
+    fn name(&self) -> &Option<String> {
+        &self.name
     }
 }
 
