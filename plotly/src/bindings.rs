@@ -3,6 +3,8 @@
 //! library is available, (i.e. via a CDN).
 
 use js_sys::Object;
+use serde::Serialize;
+use std::hash::Hash;
 use wasm_bindgen::prelude::*;
 
 use crate::Plot;
@@ -22,7 +24,7 @@ extern "C" {
 /// The function signature is slightly constrained in that `id` is a `&str`
 /// which represents the `id` of an existing HTML `div` element, rather than
 /// also allowing an instance of a `div` element, itself.
-pub async fn new_plot(id: &str, plot: &Plot) {
+pub async fn new_plot<Id: Hash + Eq + ToString + Clone + Serialize>(id: &str, plot: &Plot<Id>) {
     let plot_obj = &plot.to_js_object();
 
     // This will only fail if the Rust Plotly library has produced
@@ -37,7 +39,7 @@ pub async fn new_plot(id: &str, plot: &Plot) {
 /// The function signature is slightly constrained in that `id` is a `&str`
 /// which represents the `id` of an existing HTML `div` element, rather than
 /// also allowing an instance of a `div` element, itself.
-pub async fn react(id: &str, plot: &Plot) {
+pub async fn react<Id: Hash + Eq + ToString + Clone + Serialize>(id: &str, plot: &Plot<Id>) {
     let plot_obj = &plot.to_js_object();
 
     // This will only fail if the Rust Plotly library has produced

@@ -169,9 +169,9 @@ mod tests {
     fn test_plotly_dark() {
         let template = &*PLOTLY_DARK;
         let layout = Layout::new().template(template);
-        let mut plot = Plot::new();
+        let mut plot = Plot::<String>::new();
         plot.set_layout(layout);
-        plot.add_trace(Bar::new(vec![0], vec![1]));
+        plot.add_trace("222".to_string(), Bar::new(vec![0], vec![1]));
 
         let expected =
             r##"{"template":{"layout":{"title":{"text":"","x":0.05},"font":{"color":"#f2f5fa"}"##; // etc...

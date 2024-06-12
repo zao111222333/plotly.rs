@@ -350,7 +350,7 @@ where
     }
 
     pub fn name(mut self, name: &str) -> Box<Self> {
-        self.name = Some(name.to_string());
+        self.name = Some(name.into());
         Box::new(self)
     }
 
@@ -472,8 +472,8 @@ where
         serde_json::to_string(self).unwrap()
     }
     #[inline]
-    fn name(&self) -> &Option<String> {
-        &self.name
+    fn name(&mut self, value: String) {
+        self.name = Some(value)
     }
 }
 

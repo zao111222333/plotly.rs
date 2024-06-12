@@ -1,28 +1,29 @@
-use std::{ collections::HashMap, fs::File, io::Write, path::Path};
+use std::{collections::HashMap, fmt::Debug, fs::File, hash::Hash, io::Write, path::Path};
 
 use askama::Template;
 use dyn_clone::DynClone;
 use erased_serde::Serialize as ErasedSerialize;
+use itertools::Itertools;
 use rand::{
     distributions::{Alphanumeric, DistString},
     thread_rng,
 };
-use serde::Serialize;
+use serde::{ser::SerializeSeq, Serialize};
 
 use crate::{Configuration, Layout};
 
 #[derive(Template)]
 #[template(path = "plot.html", escape = "none")]
-struct PlotTemplate<'a> {
-    plot: &'a Plot,
+struct PlotTemplate<'a, Id: Hash + Eq + ToString + Clone + Serialize> {
+    plot: &'a Plot<Id>,
     remote_plotly_js: bool,
 }
 
 #[derive(Template)]
 #[template(path = "static_plot.html", escape = "none")]
 #[cfg(not(target_family = "wasm"))]
-struct StaticPlotTemplate<'a> {
-    plot: &'a Plot,
+struct StaticPlotTemplate<'a, Id: Hash + Eq + ToString + Clone + Serialize> {
+    plot: &'a Plot<Id>,
     format: ImageFormat,
     remote_plotly_js: bool,
     width: usize,
@@ -31,15 +32,15 @@ struct StaticPlotTemplate<'a> {
 
 #[derive(Template)]
 #[template(path = "inline_plot.html", escape = "none")]
-struct InlinePlotTemplate<'a> {
-    plot: &'a Plot,
+struct InlinePlotTemplate<'a, Id: Hash + Eq + ToString + Clone + Serialize> {
+    plot: &'a Plot<Id>,
     plot_div_id: &'a str,
 }
 
 #[derive(Template)]
 #[template(path = "jupyter_notebook_plot.html", escape = "none")]
-struct JupyterNotebookPlotTemplate<'a> {
-    plot: &'a Plot,
+struct JupyterNotebookPlotTemplate<'a, Id: Hash + Eq + ToString + Clone + Serialize> {
+    plot: &'a Plot<Id>,
     plot_div_id: &'a str,
 }
 
@@ -97,7 +98,7 @@ impl std::fmt::Display for ImageFormat {
 /// understood by Plotly.js.
 pub trait Trace: DynClone + ErasedSerialize {
     fn to_json(&self) -> String;
-    fn name(&self) -> &Option<String>;
+    fn name(&mut self, value: String);
 }
 
 dyn_clone::clone_trait_object!(Trace);
@@ -109,52 +110,220 @@ pub struct Traces {
     traces: Vec<Box<dyn Trace>>,
 }
 
-#[derive(Default, Clone)]
-pub struct TraceMap {
-    trace_map: HashMap<Box<Option<String>>,Box<dyn Trace>>,
-    order: Vec<Box<Option<String>>>,
+#[derive(Default, Clone, Copy, Debug)]
+pub enum ZOrder {
+    // Hide=0,
+    #[default]
+    Normal = 1,
+    Highlight = 2,
+    Top = 3,
 }
 
-impl Serialize for TraceMap{
+#[derive(Default, Clone)]
+pub struct TraceMap<Id: Hash + Eq + ToString + Clone + Serialize> {
+    trace_map: HashMap<Id, (Box<dyn Trace>, ZOrder, usize)>,
+    normal_highlight_order: Vec<(Id, bool)>,
+    normal_highlight_traces: Vec<Id>,
+    top_traces: Vec<Id>,
+}
+
+impl<Id> Serialize for TraceMap<Id>
+where
+    Id: Hash + Eq + ToString + Clone + Serialize,
+{
     #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer {
-            Traces{
-                traces:
-                self.order.iter().map(|id|self.trace_map[id].clone()).collect()
-            }.serialize(serializer)
+        S: serde::Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.trace_map.len()))?;
+        for trace_id in self.normal_highlight_traces.iter() {
+            seq.serialize_element(&self.trace_map[trace_id].0)?;
+        }
+        for trace_id in self.top_traces.iter() {
+            seq.serialize_element(&self.trace_map[trace_id].0)?;
+        }
+        seq.end()
     }
 }
 
-
-impl TraceMap {
+impl<Id> TraceMap<Id>
+where
+    Id: Hash + Eq + ToString + Clone + Serialize,
+{
+    #[inline]
+    pub fn updata_normal_highlight(&mut self) {
+        let (highlight_ids, mut normal_ids): (Vec<_>, Vec<_>) = self
+            .normal_highlight_order
+            .iter()
+            .partition_map(|(id, is_highlight)| {
+                if *is_highlight {
+                    itertools::Either::Left(id.clone())
+                } else {
+                    itertools::Either::Right(id.clone())
+                }
+            });
+        normal_ids.extend(highlight_ids);
+        self.normal_highlight_traces = normal_ids;
+        for (idx, trace_id) in self.normal_highlight_traces.iter().enumerate() {
+            self.trace_map.get_mut(trace_id).unwrap().2 = idx;
+        }
+    }
+    #[inline]
+    pub fn updata_top(&mut self) {
+        let normal_highlight_len = self.normal_highlight_traces.len();
+        for (idx, trace_id) in self.top_traces.iter().enumerate() {
+            self.trace_map.get_mut(trace_id).unwrap().2 = idx + normal_highlight_len;
+        }
+    }
     #[inline]
     pub fn new() -> Self {
         Self {
             trace_map: HashMap::with_capacity(1),
-            order: Vec::with_capacity(1),
+            normal_highlight_order: Vec::with_capacity(1),
+            normal_highlight_traces: Vec::with_capacity(1),
+            top_traces: Vec::with_capacity(1),
         }
     }
     #[inline]
-    pub fn push(&mut self, trace: Box<dyn Trace>) {
-        let id = Box::new(trace.name().clone());
-        match self.trace_map.insert(id.clone(), trace){
-            Some(_) => (),
-            None => self.order.push(id),
+    pub fn add_trace(&mut self, id: Id, trace_zorder: (Box<dyn Trace>, ZOrder)) {
+        let (mut trace, zorder) = trace_zorder;
+        trace.as_mut().name(id.to_string());
+        match self
+            .trace_map
+            .insert(id.clone(), (trace, zorder, self.trace_map.len()))
+        {
+            Some((_, old_zorder, _)) => match (old_zorder, zorder) {
+                (ZOrder::Normal, ZOrder::Normal) => (),
+                (ZOrder::Normal, ZOrder::Highlight) => {
+                    if let Some(old_idx) = self
+                        .normal_highlight_order
+                        .iter()
+                        .position(|(_id, _)| id.eq(_id))
+                    {
+                        self.normal_highlight_order[old_idx].1 = true;
+                        self.updata_normal_highlight();
+                    }
+                }
+                (ZOrder::Normal | ZOrder::Highlight, ZOrder::Top) => {
+                    if let Some(old_idx) = self
+                        .normal_highlight_order
+                        .iter()
+                        .position(|(_id, _)| id.eq(_id))
+                    {
+                        self.normal_highlight_order.remove(old_idx);
+                        self.top_traces.push(id);
+                        self.updata_normal_highlight();
+                        self.updata_top();
+                    }
+                }
+                (ZOrder::Highlight, ZOrder::Normal) => {
+                    if let Some(old_idx) = self
+                        .normal_highlight_order
+                        .iter()
+                        .position(|(_id, _)| id.eq(_id))
+                    {
+                        self.normal_highlight_order[old_idx].1 = false;
+                        self.updata_normal_highlight();
+                    }
+                }
+                (ZOrder::Highlight, ZOrder::Highlight) => (),
+                (ZOrder::Top, ZOrder::Normal) => {
+                    if let Some(old_idx) = self.top_traces.iter().position(|_id| id.eq(_id)) {
+                        self.top_traces.remove(old_idx);
+                        self.normal_highlight_order.push((id, false));
+                        self.updata_normal_highlight();
+                        self.updata_top();
+                    }
+                }
+                (ZOrder::Top, ZOrder::Highlight) => {
+                    if let Some(old_idx) = self.top_traces.iter().position(|_id| id.eq(_id)) {
+                        self.top_traces.remove(old_idx);
+                        self.normal_highlight_order.push((id, true));
+                        self.updata_normal_highlight();
+                        self.updata_top();
+                    }
+                }
+                (ZOrder::Top, ZOrder::Top) => (),
+            },
+            None => match zorder {
+                ZOrder::Normal => {
+                    self.normal_highlight_order.push((id, false));
+                    self.updata_normal_highlight();
+                }
+                ZOrder::Highlight => {
+                    self.normal_highlight_order.push((id, true));
+                    self.updata_normal_highlight();
+                }
+                ZOrder::Top => {
+                    self.top_traces.push(id);
+                    self.updata_top();
+                }
+            },
+        };
+    }
+
+    #[inline]
+    pub fn set_normal_highlight(&mut self, id: &Id, is_highlight: bool) {
+        if let Some((_, zorder, _)) = self.trace_map.get_mut(id) {
+            if let Some(idx) = self
+                .normal_highlight_order
+                .iter()
+                .position(|(_id, _)| id.eq(_id))
+            {
+                self.normal_highlight_order[idx].1 = is_highlight;
+            }
+            if is_highlight {
+                *zorder = ZOrder::Highlight;
+            } else {
+                *zorder = ZOrder::Normal;
+            }
+        }
+        self.updata_normal_highlight();
+    }
+
+    #[inline]
+    pub fn remove_trace(&mut self, id: &Id) -> Option<(Box<dyn Trace>, ZOrder)> {
+        match self.trace_map.remove(id) {
+            Some((trace, zorder, _)) => {
+                match zorder {
+                    ZOrder::Normal | ZOrder::Highlight => {
+                        if let Some(old_idx) = self
+                            .normal_highlight_order
+                            .iter()
+                            .position(|(_id, _)| id.eq(_id))
+                        {
+                            self.normal_highlight_order.remove(old_idx);
+                            self.normal_highlight_traces.remove(old_idx);
+                        }
+                    }
+                    ZOrder::Top => {
+                        if let Some(old_idx) = self.top_traces.iter().position(|_id| id.eq(_id)) {
+                            self.top_traces.remove(old_idx);
+                        }
+                    }
+                };
+                Some((trace, zorder))
+            }
+            None => None,
+        }
+    }
+    #[inline]
+    pub fn idx(&self, id: &Id) -> Option<usize> {
+        if let Some((_, _, idx)) = self.trace_map.get(id) {
+            Some(*idx)
+        } else {
+            None
         }
     }
 
     #[inline]
-    pub fn remove(&mut self, id: &Box<Option<String>>) -> Option<Box<dyn Trace>> {
-        let mut iter = self.order.iter().enumerate();
-        while let Some((idx,order_id)) = iter.next() {
-            if order_id.eq(id){
-                self.order.remove(idx);
-                break;
-            }
+    pub fn id(&self, idx: usize) -> &Id {
+        if idx < self.normal_highlight_traces.len() {
+            self.normal_highlight_traces.get(idx).unwrap()
+        } else {
+            self.top_traces.get(idx).unwrap()
         }
-        self.trace_map.remove(id)
     }
 
     pub fn len(&self) -> usize {
@@ -170,12 +339,11 @@ impl TraceMap {
     //         let trace:Box<dyn Trace>=trace.clone();trace}).collect::<Vec<_>>();
     //     v.into_iter()
     // }
-
+    #[inline]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
 }
-
 
 impl Traces {
     pub fn new() -> Self {
@@ -252,9 +420,9 @@ impl Traces {
 /// }
 /// ```
 #[derive(Default, Serialize, Clone)]
-pub struct Plot {
+pub struct Plot<Id: Hash + Eq + ToString + Clone + Serialize> {
     #[serde(rename = "data")]
-    traces: Traces,
+    traces: TraceMap<Id>,
     layout: Layout,
     #[serde(rename = "config")]
     configuration: Configuration,
@@ -262,13 +430,18 @@ pub struct Plot {
     remote_plotly_js: bool,
 }
 
-impl Plot {
+impl<Id> Plot<Id>
+where
+    Id: Hash + Eq + ToString + Clone + Serialize,
+{
     /// Create a new `Plot`.
-    pub fn new() -> Plot {
+    #[inline]
+    pub fn new() -> Plot<Id> {
         Plot {
-            traces: Traces::new(),
+            traces: TraceMap::new(),
             remote_plotly_js: true,
-            ..Default::default()
+            layout: Default::default(),
+            configuration: Default::default(),
         }
     }
 
@@ -280,33 +453,62 @@ impl Plot {
     /// Note that when using `Plot::to_inline_html()`, it is assumed that the
     /// `plotly.js` library is already in scope, so setting this attribute
     /// will have no effect.
+    #[inline]
     pub fn use_local_plotly(&mut self) {
         self.remote_plotly_js = false;
     }
 
     /// Add a `Trace` to the `Plot`.
-    pub fn add_trace(&mut self, trace: Box<dyn Trace>) {
-        self.traces.push(trace);
+    #[inline]
+    pub fn add_trace(&mut self, id: Id, trace: Box<dyn Trace>) {
+        self.traces.add_trace(id, (trace, ZOrder::Normal));
     }
 
-    pub fn remove_trace(&mut self, trace_idx: usize) -> Option<Box<dyn Trace>> {
-        self.traces.remove(trace_idx)
-    }
-
-    pub fn remove_traces(&mut self, mut trace_idxs: Vec<usize>) -> Vec<Option<Box<dyn Trace>>> {
-        trace_idxs.sort();
-        trace_idxs
-            .into_iter()
-            .rev()
-            .map(|idx| self.traces.remove(idx))
-            .collect()
+    /// Add a `Trace` to the `Plot`.
+    #[inline]
+    pub fn add_trace_zorder(&mut self, id: Id, trace_zorder: (Box<dyn Trace>, ZOrder)) {
+        self.traces.add_trace(id, trace_zorder);
     }
 
     /// Add multiple `Trace`s to the `Plot`.
-    pub fn add_traces(&mut self, traces: Vec<Box<dyn Trace>>) {
-        for trace in traces {
-            self.add_trace(trace);
+    #[inline]
+    pub fn add_traces(&mut self, traces: Vec<(Id, Box<dyn Trace>)>) {
+        for (id, trace) in traces {
+            self.add_trace(id, trace);
         }
+    }
+
+    /// Add multiple `Trace`s to the `Plot`.
+    #[inline]
+    pub fn add_traces_zorder(&mut self, traces_zorder: Vec<(Id, Box<dyn Trace>, ZOrder)>) {
+        for (id, trace, order) in traces_zorder {
+            self.add_trace_zorder(id, (trace, order))
+        }
+    }
+
+    #[inline]
+    pub fn idx(&self, id: &Id) -> Option<usize> {
+        self.traces.idx(id)
+    }
+
+    #[inline]
+    pub fn id(&self, idx: usize) -> &Id {
+        self.traces.id(idx)
+    }
+
+    #[inline]
+    pub fn set_normal_highlight(&mut self, id: &Id, is_highlight: bool) {
+        self.traces.set_normal_highlight(id, is_highlight);
+    }
+
+    #[inline]
+    pub fn remove_trace(&mut self, id: &Id) -> Option<(Box<dyn Trace>, ZOrder)> {
+        self.traces.remove_trace(id)
+    }
+
+    #[inline]
+    pub fn remove_traces(&mut self, ids: &Vec<Id>) -> Vec<Option<(Box<dyn Trace>, ZOrder)>> {
+        ids.iter().map(|id| self.remove_trace(id)).collect()
     }
 
     /// Set the `Layout` to be used by `Plot`.
@@ -320,7 +522,7 @@ impl Plot {
     }
 
     /// Get the contained data elements.
-    pub fn data(&self) -> &Traces {
+    pub fn data(&self) -> &TraceMap<Id> {
         &self.traces
     }
 
@@ -362,7 +564,7 @@ impl Plot {
         }
 
         // Hand off the job of opening the browser to an OS-specific implementation.
-        Plot::show_with_default_app(temp_path);
+        Plot::<Id>::show_with_default_app(temp_path);
     }
 
     /// Display the fully rendered `Plot` as a static image of the given format
@@ -391,7 +593,7 @@ impl Plot {
         }
 
         // Hand off the job of opening the browser to an OS-specific implementation.
-        Plot::show_with_default_app(temp_path);
+        Plot::<Id>::show_with_default_app(temp_path);
     }
 
     /// Save the rendered `Plot` to a file at the given location.
@@ -522,7 +724,7 @@ impl Plot {
         };
         tmpl.render().unwrap()
     }
-
+    #[inline]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
@@ -568,7 +770,10 @@ impl Plot {
     }
 }
 
-impl PartialEq for Plot {
+impl<Id> PartialEq for Plot<Id>
+where
+    Id: Hash + Eq + ToString + Clone + Serialize,
+{
     fn eq(&self, other: &Self) -> bool {
         self.to_json() == other.to_json()
     }
@@ -583,10 +788,10 @@ mod tests {
     use super::*;
     use crate::Scatter;
 
-    fn create_test_plot() -> Plot {
+    fn create_test_plot() -> Plot<String> {
         let trace1 = Scatter::new(vec![0, 1, 2], vec![6, 10, 2]).name("trace1");
-        let mut plot = Plot::new();
-        plot.add_trace(trace1);
+        let mut plot = Plot::<String>::new();
+        plot.add_trace("aaa".to_string(), trace1);
         plot
     }
 
@@ -709,8 +914,8 @@ mod tests {
     fn test_plot_neq() {
         let plot1 = create_test_plot();
         let trace2 = Scatter::new(vec![10, 1, 2], vec![6, 10, 2]).name("trace2");
-        let mut plot2 = Plot::new();
-        plot2.add_trace(trace2);
+        let mut plot2 = Plot::<String>::new();
+        plot2.add_trace("bbb".into(), trace2);
 
         assert!(plot1 != plot2);
     }
