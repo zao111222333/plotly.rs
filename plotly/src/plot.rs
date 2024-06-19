@@ -187,8 +187,7 @@ where
     }
     #[inline]
     pub fn add_trace(&mut self, id: Id, trace_zorder: (Box<dyn Trace>, ZOrder)) {
-        let (mut trace, zorder) = trace_zorder;
-        trace.as_mut().name(id.to_string());
+        let (trace, zorder) = trace_zorder;
         match self
             .trace_map
             .insert(id.clone(), (trace, zorder, self.trace_map.len()))
